@@ -6,7 +6,7 @@ import io
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, pipeline
 import torch
 import numpy as np
 import warnings
@@ -35,8 +35,7 @@ from nltk.tokenize import word_tokenize
 
 # Configure page
 st.set_page_config(
-    page_title="TikTok Sentiment Analysis Dashboard",
-    page_icon="🎯",
+    page_title="TikTok #gta6 Analysis Dashboard",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -194,6 +193,71 @@ def load_roberta_model():
     model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME)
     return tokenizer, model
 
+# --- Emotion Detection ---
+@st.cache_resource
+def load_emotion_model():
+    """Load emotion detection model"""
+    try:
+        # Using a robust emotion detection model
+        emotion_classifier = pipeline(
+            "text-classification",
+            model="j-hartmann/emotion-english-distilroberta-base",
+            return_all_scores=True
+        )
+        return emotion_classifier
+    except Exception as e:
+        st.error(f"Failed to load emotion model: {e}")
+        return None
+
+def analyze_emotions(texts, emotion_classifier, batch_size=32):
+    """Analyze emotions in batch for efficiency"""
+    if emotion_classifier is None:
+        return [], []
+    
+    # Filter out empty or invalid texts
+    processed_texts = []
+    indices = []
+    
+    for i, text in enumerate(texts):
+        if pd.notna(text) and isinstance(text, str) and text.strip():
+            # Truncate very long texts to avoid memory issues
+            processed_text = str(text)[:512]
+            processed_texts.append(processed_text)
+            indices.append(i)
+    
+    if not processed_texts:
+        return ['Unknown'] * len(texts), [0.0] * len(texts)
+    
+    # Process in batches
+    all_emotions = []
+    all_confidences = []
+    
+    try:
+        for i in range(0, len(processed_texts), batch_size):
+            batch = processed_texts[i:i+batch_size]
+            batch_results = emotion_classifier(batch)
+            
+            for result in batch_results:
+                # Find the emotion with highest score
+                best_emotion = max(result, key=lambda x: x['score'])
+                all_emotions.append(best_emotion['label'])
+                all_confidences.append(best_emotion['score'])
+        
+        # Create final results with proper indexing
+        final_emotions = ['Unknown'] * len(texts)
+        final_confidences = [0.0] * len(texts)
+        
+        for i, idx in enumerate(indices):
+            if i < len(all_emotions):
+                final_emotions[idx] = all_emotions[i]
+                final_confidences[idx] = all_confidences[i]
+        
+        return final_emotions, final_confidences
+        
+    except Exception as e:
+        st.error(f"Emotion analysis failed: {e}")
+        return ['Unknown'] * len(texts), [0.0] * len(texts)
+
 def roberta_sentiment_score(text, tokenizer, model):
     if pd.isna(text) or not isinstance(text, str) or text.strip() == "":
         return None, None
@@ -223,9 +287,27 @@ def analyze_with_roberta(df, text_column='caption'):
     
     return df
 
+def analyze_with_emotions(df, text_column='caption'):
+    """Add emotion analysis to dataframe"""
+    emotion_classifier = load_emotion_model()
+    
+    if emotion_classifier is None:
+        df[f'{text_column}_emotion'] = 'Unknown'
+        df[f'{text_column}_emotion_confidence'] = 0.0
+        return df
+    
+    with st.spinner(f"Analyzing emotions in {text_column}..."):
+        texts = df[text_column].fillna('').astype(str).tolist()
+        emotions, confidences = analyze_emotions(texts, emotion_classifier)
+        
+        df[f'{text_column}_emotion'] = emotions
+        df[f'{text_column}_emotion_confidence'] = confidences
+    
+    return df
+
 # --- Streamlit UI ---
-st.title("🎯 TikTok Sentiment Analysis Dashboard")
-st.markdown("*Sentiment analysis and topic modeling of TikTok captions with engagement metrics*")
+st.title("🎯 TikTok Sentiment & Emotion Analysis Dashboard")
+st.markdown("*Comprehensive sentiment analysis, emotion detection, and topic modeling of TikTok content*")
 
 # Sidebar controls
 st.sidebar.header("📊 Dashboard Controls")
@@ -233,6 +315,11 @@ auto_refresh = st.sidebar.checkbox("Auto-refresh data", value=False)
 
 if auto_refresh:
     st.sidebar.info("Data refreshes every 5 minutes")
+
+# Analysis options
+st.sidebar.subheader("🔍 Analysis Options")
+analyze_captions = st.sidebar.checkbox("Analyze Caption Emotions", value=True)
+analyze_comments = st.sidebar.checkbox("Analyze Comment Emotions", value=True)
 
 # Topic modeling controls
 st.sidebar.subheader("🔍 Topic Analysis Settings")
@@ -256,9 +343,26 @@ if df is None or df.empty:
     st.warning("⚠️ No data found")
     st.stop()
 
-# Process data
+# Process sentiment data
 with st.spinner("Analyzing sentiment..."):
     df = analyze_with_roberta(df)
+
+# Process emotion data
+if analyze_captions and 'caption' in df.columns:
+    df = analyze_with_emotions(df, 'caption')
+
+if analyze_comments and 'comments' in df.columns:
+    # Check if we have comment text column
+    comment_text_col = None
+    for col in df.columns:
+        if 'comment' in col.lower() and 'text' in col.lower():
+            comment_text_col = col
+            break
+    
+    if comment_text_col:
+        df = analyze_with_emotions(df, comment_text_col)
+    else:
+        st.sidebar.warning("No comment text column found for emotion analysis")
 
 # Ensure we have the required columns
 required_columns = ['comments', 'caption']
@@ -271,7 +375,7 @@ if missing_columns:
 df['comments'] = pd.to_numeric(df['comments'], errors='coerce').fillna(0)
 
 # Main metrics
-col1, col2, col3 = st.columns(3)
+col1, col2, col3, col4 = st.columns(4)
 
 with col1:
     st.metric(
@@ -282,11 +386,21 @@ with col1:
 with col2:
     avg_confidence = df['roberta_confidence'].mean()
     st.metric(
-        "🎯 Avg Confidence", 
+        "🎯 Avg Sentiment Confidence", 
         f"{avg_confidence:.1%}"
     )
 
 with col3:
+    if 'caption_emotion_confidence' in df.columns:
+        avg_emotion_conf = df['caption_emotion_confidence'].mean()
+        st.metric(
+            "😊 Avg Emotion Confidence",
+            f"{avg_emotion_conf:.1%}"
+        )
+    else:
+        st.metric("😊 Emotion Analysis", "Disabled")
+
+with col4:
     avg_comments = df['comments'].mean()
     st.metric(
         "💬 Avg Comments", 
@@ -301,11 +415,23 @@ sentiment_filter = st.sidebar.multiselect(
     default=df['roberta_sentiment_label'].unique()
 )
 
+# Emotion filter
+if 'caption_emotion' in df.columns:
+    emotion_filter = st.sidebar.multiselect(
+        "Filter by Emotion",
+        options=df['caption_emotion'].unique(),
+        default=df['caption_emotion'].unique()
+    )
+else:
+    emotion_filter = []
+
 # Apply filters
 filtered_df = df[df['roberta_sentiment_label'].isin(sentiment_filter)]
+if emotion_filter and 'caption_emotion' in df.columns:
+    filtered_df = filtered_df[filtered_df['caption_emotion'].isin(emotion_filter)]
 
 # Create tabs for different analyses
-tab1, tab2, tab3 = st.tabs(["📊 Sentiment Analysis", "🔍 Topic Modeling", "📄 Detailed Data"])
+tab1, tab2, tab3, tab4 = st.tabs(["📊 Sentiment Analysis", "😊 Emotion Analysis", "🔍 Topic Modeling", "📄 Detailed Data"])
 
 with tab1:
     # Interactive visualizations
@@ -360,6 +486,103 @@ with tab1:
         st.plotly_chart(fig_bar, use_container_width=True)
 
 with tab2:
+    st.header("😊 Emotion Analysis")
+    
+    if 'caption_emotion' in filtered_df.columns:
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.subheader("🎭 Emotion Distribution")
+            emotion_counts = filtered_df['caption_emotion'].value_counts()
+            
+            # Define colors for emotions
+            emotion_colors = {
+                'joy': '#FFD700',
+                'anger': '#FF4500',
+                'fear': '#800080',
+                'sadness': '#4169E1',
+                'surprise': '#FF69B4',
+                'disgust': '#228B22',
+                'love': '#FF1493',
+                'optimism': '#32CD32',
+                'pessimism': '#696969',
+                'trust': '#87CEEB',
+                'anticipation': '#FFA500',
+                'Unknown': '#95a5a6'
+            }
+            
+            fig_emotion_pie = px.pie(
+                values=emotion_counts.values,
+                names=emotion_counts.index,
+                title="Emotion Distribution in Captions",
+                color=emotion_counts.index,
+                color_discrete_map=emotion_colors
+            )
+            fig_emotion_pie.update_traces(textposition='inside', textinfo='percent+label')
+            fig_emotion_pie.update_layout(showlegend=True, height=400)
+            st.plotly_chart(fig_emotion_pie, use_container_width=True)
+        
+        with col2:
+            st.subheader("📈 Comments by Emotion")
+            
+            engagement_by_emotion = filtered_df.groupby('caption_emotion')[
+                'comments'
+            ].mean().reset_index()
+            
+            fig_emotion_bar = px.bar(
+                engagement_by_emotion,
+                x='caption_emotion',
+                y='comments',
+                title="Average Comments by Emotion",
+                color='caption_emotion',
+                color_discrete_map=emotion_colors
+            )
+            fig_emotion_bar.update_layout(
+                xaxis_title="Emotion",
+                yaxis_title="Average Comments",
+                height=400,
+                showlegend=False,
+                xaxis_tickangle=-45
+            )
+            st.plotly_chart(fig_emotion_bar, use_container_width=True)
+        
+        # Emotion-Sentiment Heatmap
+        st.subheader("🔥 Emotion vs Sentiment Heatmap")
+        
+        emotion_sentiment_crosstab = pd.crosstab(
+            filtered_df['caption_emotion'],
+            filtered_df['roberta_sentiment_label'],
+            normalize='index'
+        )
+        
+        fig_heatmap = px.imshow(
+            emotion_sentiment_crosstab.values,
+            x=emotion_sentiment_crosstab.columns,
+            y=emotion_sentiment_crosstab.index,
+            aspect='auto',
+            title="Emotion-Sentiment Distribution (Normalized by Emotion)",
+            color_continuous_scale='RdYlBu'
+        )
+        fig_heatmap.update_layout(height=400)
+        st.plotly_chart(fig_heatmap, use_container_width=True)
+        
+        # Top emotions by confidence
+        st.subheader("🎯 Most Confident Emotion Predictions")
+        
+        high_confidence_emotions = filtered_df[
+            filtered_df['caption_emotion_confidence'] > 0.7
+        ].groupby('caption_emotion').agg({
+            'caption_emotion_confidence': 'mean',
+            'caption': 'count'
+        }).round(3).sort_values('caption_emotion_confidence', ascending=False)
+        
+        high_confidence_emotions.columns = ['Avg Confidence', 'Count']
+        st.dataframe(high_confidence_emotions, use_container_width=True)
+        
+    else:
+        st.info("Emotion analysis was not enabled or failed to load. Please enable it in the sidebar.")
+
+with tab3:
     st.header("🔍 Topic Modeling Analysis")
     
     # Prepare text for analysis
@@ -464,37 +687,58 @@ with tab2:
         else:
             st.error("LDA analysis failed. Please check your data and reduce the number of topics.")
 
-    # Topics by Sentiment
+    # Topics by Sentiment and Emotion
     if lda_topics is not None and doc_topic_probs is not None:
-        st.subheader("🎭 Topics by Sentiment")
+        st.subheader("🎭 Topics by Sentiment & Emotion")
         
         # Assign dominant topic to each document
         dominant_topics = np.argmax(doc_topic_probs, axis=1)
         
-        # Create a DataFrame with topics and sentiments
-        topic_sentiment_df = pd.DataFrame({
+        # Create a DataFrame with topics, sentiments, and emotions
+        topic_analysis_df = pd.DataFrame({
             'dominant_topic': [f"Topic {i+1}" for i in dominant_topics],
             'sentiment': filtered_df['roberta_sentiment_label'].iloc[:len(dominant_topics)].values
         })
         
-        # Create heatmap data
+        if 'caption_emotion' in filtered_df.columns:
+            topic_analysis_df['emotion'] = filtered_df['caption_emotion'].iloc[:len(dominant_topics)].values
+        
+        # Sentiment heatmap
         topic_sentiment_crosstab = pd.crosstab(
-            topic_sentiment_df['dominant_topic'], 
-            topic_sentiment_df['sentiment'],
+            topic_analysis_df['dominant_topic'], 
+            topic_analysis_df['sentiment'],
             normalize='index'
         )
         
-        fig_heatmap = px.imshow(
+        fig_sentiment_heatmap = px.imshow(
             topic_sentiment_crosstab.values,
             x=topic_sentiment_crosstab.columns,
             y=topic_sentiment_crosstab.index,
             aspect='auto',
-            title="Topic-Sentiment Distribution (Normalized by Topic)"
+            title="Topic-Sentiment Distribution"
         )
-        fig_heatmap.update_layout(height=400)
-        st.plotly_chart(fig_heatmap, use_container_width=True)
+        fig_sentiment_heatmap.update_layout(height=300)
+        st.plotly_chart(fig_sentiment_heatmap, use_container_width=True)
+        
+        # Emotion heatmap (if available)
+        if 'emotion' in topic_analysis_df.columns:
+            topic_emotion_crosstab = pd.crosstab(
+                topic_analysis_df['dominant_topic'], 
+                topic_analysis_df['emotion'],
+                normalize='index'
+            )
+            
+            fig_emotion_heatmap = px.imshow(
+                topic_emotion_crosstab.values,
+                x=topic_emotion_crosstab.columns,
+                y=topic_emotion_crosstab.index,
+                aspect='auto',
+                title="Topic-Emotion Distribution"
+            )
+            fig_emotion_heatmap.update_layout(height=300)
+            st.plotly_chart(fig_emotion_heatmap, use_container_width=True)
 
-with tab3:
+with tab4:
     # Detailed data table
     st.subheader("📄 Detailed Data")
 
@@ -508,6 +752,10 @@ with tab3:
 
     # Select columns to display
     default_cols = ['caption', 'roberta_sentiment_label', 'roberta_confidence', 'comments']
+    
+    # Add emotion columns if available
+    if 'caption_emotion' in display_df.columns:
+        default_cols.extend(['caption_emotion', 'caption_emotion_confidence'])
 
     columns_to_show = st.multiselect(
         "Select columns to display:",
@@ -525,9 +773,89 @@ with tab3:
     # Summary statistics
     with st.expander("📊 Summary Statistics"):
         st.write("**Sentiment Analysis Summary:**")
-        summary_stats = filtered_df.groupby('roberta_sentiment_label').agg({
+        sentiment_stats = filtered_df.groupby('roberta_sentiment_label').agg({
             'roberta_confidence': ['mean', 'std'],
             'comments': ['mean', 'std']
         }).round(3)
         
-        st.dataframe(summary_stats)
+        st.dataframe(sentiment_stats)
+        
+        # Emotion statistics if available
+        if 'caption_emotion' in filtered_df.columns:
+            st.write("**Emotion Analysis Summary:**")
+            emotion_stats = filtered_df.groupby('caption_emotion').agg({
+                'caption_emotion_confidence': ['mean', 'std'],
+                'comments': ['mean', 'std']
+            }).round(3)
+            
+            st.dataframe(emotion_stats)
+            
+            # Cross-tabulation of sentiment and emotion
+            st.write("**Sentiment-Emotion Cross-Tabulation:**")
+            cross_tab = pd.crosstab(
+                filtered_df['roberta_sentiment_label'],
+                filtered_df['caption_emotion'],
+                margins=True
+            )
+            st.dataframe(cross_tab)
+
+# Footer with analysis insights
+st.markdown("---")
+st.subheader("🧠 Analysis Insights")
+
+col1, col2 = st.columns(2)
+
+with col1:
+    st.markdown("**Key Findings:**")
+    
+    # Sentiment insights
+    most_common_sentiment = filtered_df['roberta_sentiment_label'].mode().iloc[0]
+    sentiment_percentage = (filtered_df['roberta_sentiment_label'] == most_common_sentiment).mean() * 100
+    
+    st.write(f"• Most common sentiment: **{most_common_sentiment}** ({sentiment_percentage:.1f}%)")
+    
+    # Engagement insights
+    high_engagement = filtered_df['comments'].quantile(0.75)
+    high_engagement_sentiment = filtered_df[filtered_df['comments'] > high_engagement]['roberta_sentiment_label'].mode()
+    
+    if not high_engagement_sentiment.empty:
+        st.write(f"• High-engagement posts are mostly: **{high_engagement_sentiment.iloc[0]}**")
+    
+    # Emotion insights if available
+    if 'caption_emotion' in filtered_df.columns:
+        most_common_emotion = filtered_df['caption_emotion'].mode().iloc[0]
+        emotion_percentage = (filtered_df['caption_emotion'] == most_common_emotion).mean() * 100
+        st.write(f"• Most common emotion: **{most_common_emotion}** ({emotion_percentage:.1f}%)")
+
+with col2:
+    st.markdown("**Recommendations:**")
+    st.write("• Monitor negative sentiment spikes for community management")
+    st.write("• Leverage high-engagement emotions for content strategy")
+    st.write("• Use topic modeling insights for targeted campaigns")
+    if 'caption_emotion' in filtered_df.columns:
+        st.write("• Create content that resonates with dominant emotions")
+    st.write("• Track sentiment trends over time for brand monitoring")
+
+# Export functionality
+st.markdown("---")
+st.subheader("📁 Export Data")
+
+export_cols = st.multiselect(
+    "Select columns to export:",
+    options=filtered_df.columns.tolist(),
+    default=['caption', 'roberta_sentiment_label', 'roberta_confidence', 'comments'] + 
+             (['caption_emotion', 'caption_emotion_confidence'] if 'caption_emotion' in filtered_df.columns else [])
+)
+
+if export_cols:
+    export_df = filtered_df[export_cols]
+    
+    # Convert to CSV
+    csv_data = export_df.to_csv(index=False)
+    
+    st.download_button(
+        label="📥 Download Filtered Data as CSV",
+        data=csv_data,
+        file_name=f"tiktok_analysis_filtered_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.csv",
+        mime="text/csv"
+    )
