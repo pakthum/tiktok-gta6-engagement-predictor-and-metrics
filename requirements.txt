@@ -1,7 +1,12 @@
 streamlit
-torch
-transformers
 pandas
-scikit-learn
 nltk
 google-cloud-storage
+plotly
+transformers
+torch
+scikit-learn
+wordcloud
+matplotlib
+asyncio
+playwright
