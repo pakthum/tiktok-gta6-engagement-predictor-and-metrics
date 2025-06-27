@@ -3,14 +3,5 @@ torch
 transformers
 pandas
 scikit-learn
-google-cloud-storage
 nltk
-io
-plotly
-numpy
-warnings
-sklearn
-wordcloud
-collections
-re
-matplotlib
+google-cloud-storage
