@@ -18,6 +18,8 @@ import re
 from collections import Counter
 from wordcloud import WordCloud
 import matplotlib.pyplot as plt
+import os
+import json
 
 # Download required NLTK data
 try:
@@ -30,12 +32,38 @@ except LookupError:
 from nltk.corpus import stopwords
 from nltk.tokenize import word_tokenize
 
-# Configure page
-st.set_page_config(
-    page_title="TikTok #gta6 Analysis Dashboard",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+import streamlit as st
+import os
+import json
+from google.cloud import storage
+
+# Use st.cache_resource to initialize the client once and cache it.
+@st.cache_resource
+def get_gcs_client():
+    """
+    Initialize GCS client using service account JSON from an environment variable.
+    Caches the client object for efficiency.
+    """
+    try:
+        # Get the JSON credentials from the environment variable (set by Streamlit Cloud secrets)
+        gcp_creds_json = os.environ.get("GCP_CREDS")
+        if not gcp_creds_json:
+            st.error("GCP_CREDS environment variable not found. Please set it in your Streamlit Cloud app settings.")
+            return None
+
+        # Parse the JSON credentials string into a dictionary
+        gcp_creds = json.loads(gcp_creds_json)
+
+        # Create client from service account info
+        client = storage.Client.from_service_account_info(gcp_creds)
+        return client
+
+    except json.JSONDecodeError as e:
+        st.error(f"Error parsing GCP_CREDS JSON: {e}. Please ensure it's a valid JSON string.")
+        return None
+    except Exception as e:
+        st.error(f"An unexpected error occurred when initializing the GCS client: {e}")
+        return None
 
 # --- Google Cloud Cred CONFIG ---
 BUCKET_NAME = "tiktok-sentiment-data"
@@ -150,17 +178,44 @@ def perform_lda_analysis(texts, n_topics=5, max_features=100):
         return None, None, None
 
 # --- Load CSV from GCS ---
-@st.cache_data(ttl=300)  
+@st.cache_data(ttl=300)  # Cache the data for 5 minutes
 def load_csv_from_gcs(bucket_name, blob_name):
+    """
+    Load a CSV file from Google Cloud Storage with proper error handling.
+    """
     try:
-        client = storage.Client("elliptical-rite-464103-b7-97c5e8f7add2.json")
+        # Get the GCS client (this will be cached by @st.cache_resource)
+        client = get_gcs_client()
+        if client is None:
+            # The get_gcs_client function has already displayed an error message.
+            return None, "Failed to initialize GCS client."
+
+        # Get the bucket
         bucket = client.bucket(bucket_name)
+
+        # Get the blob and check if it exists
         blob = bucket.blob(blob_name)
+        if not blob.exists():
+            error_message = f"File '{blob_name}' not found in bucket '{bucket_name}'."
+            st.error(error_message)
+            return None, error_message
+
+        # Download and read the CSV into a pandas DataFrame
+        st.info(f"Downloading data from gs://{bucket_name}/{blob_name}...")
         csv_data = blob.download_as_text()
         df = pd.read_csv(io.StringIO(csv_data))
+
+        if df.empty:
+            st.warning("The CSV file is empty.")
+            return None, "CSV file is empty"
+
+        st.success(f"Successfully loaded {len(df)} rows from {blob_name}")
         return df, None
+
     except Exception as e:
-        return None, str(e)
+        error_message = f"An unexpected error occurred while loading data from GCS: {e}"
+        st.error(error_message)
+        return None, error_message
 
 # --- RoBERTa Sentiment Analysis ---
 @st.cache_resource
