@@ -153,7 +153,7 @@ def perform_lda_analysis(texts, n_topics=5, max_features=100):
 @st.cache_data(ttl=300)  
 def load_csv_from_gcs(bucket_name, blob_name):
     try:
-        client = storage.Client()
+        client = storage.Client("elliptical-rite-464103-b7-97c5e8f7add2.json")
         bucket = client.bucket(bucket_name)
         blob = bucket.blob(blob_name)
         csv_data = blob.download_as_text()
