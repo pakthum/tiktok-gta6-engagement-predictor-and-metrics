@@ -448,6 +448,32 @@ def show_explanation_box(title, content):
     </div>
     """, unsafe_allow_html=True)
 
+
+@st.cache_data(show_spinner="Running data analysis...") # The spinner will show while this runs the first time
+def run_full_analysis(df, analyze_captions=True, analyze_comments=True):
+    """
+    Runs all the heavy analysis on the DataFrame and returns the processed DataFrame.
+    The result of this function will be cached.
+    """
+    # 1. Roberta Sentiment Analysis (on caption)
+    df = analyze_with_roberta(df.copy(), text_column='caption') # Use .copy() to avoid mutation errors with caching
+
+    # 2. Caption Emotion Analysis (if enabled)
+    if analyze_captions and 'caption' in df.columns:
+        df = analyze_with_emotions(df.copy(), text_column='caption')
+
+    # 3. Comment Emotion Analysis (if enabled)
+    # This part of your original code can be tricky to cache if 'comment_text_col' can change.
+    # For simplicity, we assume 'comments' is the target column for comment analysis.
+    if analyze_comments and 'comments' in df.columns:
+         # Note: Your original code dynamically finds the comment column.
+         # For caching to work reliably, the inputs must be consistent.
+         # If you have a specific column for comment text, use it directly here.
+         # For this example, let's assume the 'comments' column holds the text to be analyzed.
+         # This part may need adjustment based on your exact data structure.
+         df = process_tiktok_emotions(df.copy(), comment_column='comments')
+
+    return df
 # --- Streamlit UI ---
 st.title("TikTok #gta6 Analysis Dashboard")
 st.markdown("*This dashboard displays metrics related to the #gta6 hashtag page on TikTok. All data is scraped in accordance to TikTok privacy conditions.*")
