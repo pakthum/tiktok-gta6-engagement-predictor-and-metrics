@@ -32,10 +32,12 @@ except LookupError:
 from nltk.corpus import stopwords
 from nltk.tokenize import word_tokenize
 
-import streamlit as st
-import os
-import json
-from google.cloud import storage
+# Constants for column names to avoid confusion
+CAPTION_COLUMN = 'caption'
+COMMENT_TEXT_COLUMN = 'comment_text'  # Actual comment text content
+COMMENT_COUNT_COLUMN = 'comments'     # Numeric comment count
+BUCKET_NAME = "tiktok-sentiment-data"
+CSV_FILENAME = "tiktok_gta6_data.csv"
 
 # Use st.cache_resource to initialize the client once and cache it.
 @st.cache_resource
@@ -65,9 +67,44 @@ def get_gcs_client():
         st.error(f"An unexpected error occurred when initializing the GCS client: {e}")
         return None
 
-# --- Google Cloud Cred CONFIG ---
-BUCKET_NAME = "tiktok-sentiment-data"
-CSV_FILENAME = "tiktok_gta6_data.csv"
+# --- Load CSV from GCS ---
+@st.cache_data(ttl=300)  # Cache the data for 5 minutes
+def load_csv_from_gcs(bucket_name, blob_name):
+    """
+    Load a CSV file from Google Cloud Storage with proper error handling.
+    """
+    try:
+        # Get the GCS client (this will be cached by @st.cache_resource)
+        client = get_gcs_client()
+        if client is None:
+            return None, "Failed to initialize GCS client."
+
+        # Get the bucket
+        bucket = client.bucket(bucket_name)
+
+        # Get the blob and check if it exists
+        blob = bucket.blob(blob_name)
+        if not blob.exists():
+            error_message = f"File '{blob_name}' not found in bucket '{bucket_name}'."
+            st.error(error_message)
+            return None, error_message
+
+        # Download and read the CSV into a pandas DataFrame
+        st.info(f"Downloading data from gs://{bucket_name}/{blob_name}...")
+        csv_data = blob.download_as_text()
+        df = pd.read_csv(io.StringIO(csv_data))
+
+        if df.empty:
+            st.warning("The CSV file is empty.")
+            return None, "CSV file is empty"
+
+        st.success(f"Successfully loaded {len(df)} rows from {blob_name}")
+        return df, None
+
+    except Exception as e:
+        error_message = f"An unexpected error occurred while loading data from GCS: {e}"
+        st.error(error_message)
+        return None, error_message
 
 # --- Text Preprocessing ---
 @st.cache_data
@@ -81,9 +118,280 @@ def preprocess_text(text_series):
         text = re.sub(r'@\w+|#\w+', '', text)
         text = re.sub(r'[^a-zA-Z\s]', '', text)
         text = ' '.join(text.split())
-        
         return text
     return text_series.apply(clean_text)
+
+# --- RoBERTa Sentiment Analysis ---
+@st.cache_resource
+def load_roberta_model():
+    try:
+        MODEL_NAME = "cardiffnlp/twitter-roberta-base-sentiment"
+        tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+        model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME)
+        return tokenizer, model
+    except Exception as e:
+        st.error(f"Failed to load RoBERTa model: {e}")
+        return None, None
+
+# --- Emotion Detection ---
+@st.cache_resource
+def load_emotion_model():
+    """Load emotion detection model"""
+    try:
+        emotion_classifier = pipeline(
+            "text-classification",
+            model="j-hartmann/emotion-english-distilroberta-base",
+            return_all_scores=True
+        )
+        return emotion_classifier
+    except Exception as e:
+        st.error(f"Failed to load emotion model: {e}")
+        return None
+
+def roberta_sentiment_score(text, tokenizer, model):
+    """Analyze sentiment using RoBERTa model"""
+    if pd.isna(text) or not isinstance(text, str) or text.strip() == "":
+        return None, None
+    
+    try:
+        encoded = tokenizer(text, return_tensors='pt', truncation=True, max_length=512)
+        with torch.no_grad():
+            output = model(**encoded)
+        scores = torch.nn.functional.softmax(output.logits, dim=1).squeeze().numpy()
+        
+        label = np.argmax(scores)
+        confidence = scores[label]
+        
+        return label, confidence
+    except Exception as e:
+        st.warning(f"RoBERTa analysis failed for a text: {e}")
+        return None, None
+
+def analyze_with_roberta(df, text_column=CAPTION_COLUMN):
+    """Perform RoBERTa sentiment analysis on specified column"""
+    if text_column not in df.columns:
+        st.warning(f"Column '{text_column}' not found for RoBERTa analysis")
+        return df
+    
+    tokenizer, model = load_roberta_model()
+    if tokenizer is None or model is None:
+        st.error("RoBERTa model failed to load")
+        return df
+    
+    with st.spinner(f"Analyzing sentiment in {text_column}..."):
+        results = df[text_column].apply(lambda x: roberta_sentiment_score(str(x), tokenizer, model))
+        
+        df['roberta_sentiment_label'] = results.apply(
+            lambda x: ['Negative', 'Neutral', 'Positive'][x[0]] if x[0] is not None else 'Unknown'
+        )
+        df['roberta_confidence'] = results.apply(lambda x: x[1] if x[1] is not None else 0.0)
+    
+    return df
+
+def split_comments(comment_text, separator="|||"):
+    """Split comment text by separator and clean individual comments"""
+    if pd.isna(comment_text) or not isinstance(comment_text, str):
+        return []
+    
+    comments = [comment.strip() for comment in comment_text.split(separator)]
+    comments = [comment for comment in comments if comment]
+    return comments
+
+def analyze_emotions_individual(texts, emotion_classifier, batch_size=32):
+    """Analyze emotions for individual comments, handling |||separated comments"""
+    if emotion_classifier is None:
+        return [{'comments': [], 'emotions': [], 'confidences': [], 'total_comments': 0}] * len(texts)
+    
+    all_individual_comments = []
+    comment_to_original_mapping = [] 
+    for original_idx, text in enumerate(texts):
+        individual_comments = split_comments(text)
+        for comment in individual_comments:
+            if comment.strip():
+                processed_comment = comment[:512]
+                all_individual_comments.append(processed_comment)
+                comment_to_original_mapping.append(original_idx)
+    
+    if not all_individual_comments:
+        return [{'comments': [], 'emotions': [], 'confidences': [], 'total_comments': 0}] * len(texts)
+
+    try:
+        all_emotions = []
+        all_confidences = []
+        
+        for i in range(0, len(all_individual_comments), batch_size):
+            batch = all_individual_comments[i:i+batch_size]
+            batch_results = emotion_classifier(batch)
+            
+            for result in batch_results:
+                best_emotion = max(result, key=lambda x: x['score'])
+                all_emotions.append(best_emotion['label'])
+                all_confidences.append(best_emotion['score'])
+
+        results = []
+        for original_idx in range(len(texts)):
+            original_comments = []
+            original_emotions = []
+            original_confidences = []
+            
+            for comment_idx, mapped_original_idx in enumerate(comment_to_original_mapping):
+                if mapped_original_idx == original_idx:
+                    if comment_idx < len(all_individual_comments):
+                        original_comments.append(all_individual_comments[comment_idx])
+                    if comment_idx < len(all_emotions):
+                        original_emotions.append(all_emotions[comment_idx])
+                        original_confidences.append(all_confidences[comment_idx])
+            
+            results.append({
+                'comments': original_comments,
+                'emotions': original_emotions,
+                'confidences': original_confidences,
+                'total_comments': len(original_comments)
+            })
+        
+        return results
+        
+    except Exception as e:
+        st.error(f"Individual emotion analysis failed: {e}")
+        return [{'comments': [], 'emotions': [], 'confidences': [], 'total_comments': 0}] * len(texts)
+
+def get_emotion_summary(emotion_results):
+    """Get summary statistics for emotions from individual comment analysis"""
+    summaries = []
+    
+    for result in emotion_results:
+        emotions = result.get('emotions', [])
+        confidences = result.get('confidences', [])
+        
+        if not emotions:
+            summaries.append({
+                'dominant_emotion': 'Unknown',
+                'avg_confidence': 0.0,
+                'emotion_distribution': {},
+                'total_comments': 0
+            })
+            continue
+        
+        emotion_counts = {}
+        for emotion in emotions:
+            emotion_counts[emotion] = emotion_counts.get(emotion, 0) + 1
+        
+        dominant_emotion = max(emotion_counts.items(), key=lambda x: x[1])[0]
+        avg_confidence = sum(confidences) / len(confidences) if confidences else 0.0
+        total = len(emotions)
+        emotion_distribution = {emotion: (count/total)*100 
+                             for emotion, count in emotion_counts.items()}
+        
+        summaries.append({
+            'dominant_emotion': dominant_emotion,
+            'avg_confidence': avg_confidence,
+            'emotion_distribution': emotion_distribution,
+            'total_comments': total
+        })
+    
+    return summaries
+
+def analyze_with_emotions(df, text_column):
+    """Analyze emotions in specified text column"""
+    if text_column not in df.columns:
+        st.warning(f"Column '{text_column}' not found for emotion analysis")
+        return df
+    
+    emotion_classifier = load_emotion_model()
+    if emotion_classifier is None:
+        df[f'{text_column}_emotion'] = 'Unknown'
+        df[f'{text_column}_emotion_confidence'] = 0.0
+        return df
+    
+    with st.spinner(f"Analyzing emotions in {text_column}..."):
+        texts = df[text_column].fillna('').astype(str).tolist()
+        emotion_results = analyze_emotions_individual(texts, emotion_classifier)
+        emotion_summaries = get_emotion_summary(emotion_results)
+        
+        df[f'{text_column}_emotion'] = [summary['dominant_emotion'] for summary in emotion_summaries]
+        df[f'{text_column}_emotion_confidence'] = [summary['avg_confidence'] for summary in emotion_summaries]
+    
+    return df
+
+def process_tiktok_emotions(df, comment_column=COMMENT_TEXT_COLUMN):
+    """Process TikTok video comments for emotion analysis"""
+    if comment_column not in df.columns:
+        st.warning(f"Column '{comment_column}' not found for comment emotion analysis")
+        return df
+    
+    emotion_classifier = load_emotion_model()
+    if emotion_classifier is None:
+        return df
+    
+    comment_texts = df[comment_column].tolist()
+
+    st.info("Analyzing emotions for individual comments...")
+    emotion_results = analyze_emotions_individual(comment_texts, emotion_classifier)
+    emotion_summaries = get_emotion_summary(emotion_results)
+    
+    df['individual_comment_emotions'] = emotion_results
+    df['dominant_emotion'] = [summary['dominant_emotion'] for summary in emotion_summaries]
+    df['avg_emotion_confidence'] = [summary['avg_confidence'] for summary in emotion_summaries]
+    df['total_analyzed_comments'] = [summary['total_comments'] for summary in emotion_summaries]
+    
+    all_emotions = set()
+    for summary in emotion_summaries:
+        all_emotions.update(summary['emotion_distribution'].keys())
+    
+    for emotion in all_emotions:
+        df[f'{emotion}_percentage'] = [
+            summary['emotion_distribution'].get(emotion, 0) 
+            for summary in emotion_summaries
+        ]
+    
+    return df
+
+def validate_dataframe(df):
+    """Validate that the dataframe has required columns and proper data types"""
+    required_columns = [CAPTION_COLUMN]
+    missing_columns = [col for col in required_columns if col not in df.columns]
+    
+    if missing_columns:
+        return False, f"Missing required columns: {missing_columns}"
+    
+    # Check if we have either comment text or comment count
+    has_comment_text = COMMENT_TEXT_COLUMN in df.columns
+    has_comment_count = COMMENT_COUNT_COLUMN in df.columns
+    
+    if not has_comment_text and not has_comment_count:
+        return False, f"Missing both comment text column ('{COMMENT_TEXT_COLUMN}') and comment count column ('{COMMENT_COUNT_COLUMN}')"
+    
+    return True, "Validation passed"
+
+@st.cache_data(show_spinner="Running comprehensive analysis...")
+def run_full_analysis(df, analyze_captions=True, analyze_comments=True):
+    """
+    Runs all the heavy analysis on the DataFrame and returns the processed DataFrame.
+    The result of this function will be cached.
+    """
+    # Work on a copy to avoid mutation issues with caching
+    df_processed = df.copy()
+    
+    # 1. RoBERTa Sentiment Analysis (on caption)
+    df_processed = analyze_with_roberta(df_processed, text_column=CAPTION_COLUMN)
+
+    # 2. Caption Emotion Analysis (if enabled)
+    if analyze_captions and CAPTION_COLUMN in df_processed.columns:
+        df_processed = analyze_with_emotions(df_processed, text_column=CAPTION_COLUMN)
+
+    # 3. Comment Emotion Analysis (if enabled and column exists)
+    if analyze_comments and COMMENT_TEXT_COLUMN in df_processed.columns:
+        df_processed = process_tiktok_emotions(df_processed, comment_column=COMMENT_TEXT_COLUMN)
+
+    return df_processed
+
+def prepare_numeric_columns(df):
+    """Ensure numeric columns are properly typed"""
+    # If comments column exists and should be numeric (comment count)
+    if COMMENT_COUNT_COLUMN in df.columns:
+        df[COMMENT_COUNT_COLUMN] = pd.to_numeric(df[COMMENT_COUNT_COLUMN], errors='coerce').fillna(0)
+    
+    return df
 
 # --- TF-IDF Analysis ---
 @st.cache_data
@@ -93,6 +401,7 @@ def perform_tfidf_analysis(texts, max_features=100, ngram_range=(1, 2)):
     
     if not clean_texts:
         return None, None, None
+    
     stop_words = set(stopwords.words('english'))
     custom_stops = {'tiktok', 'video', 'gta', 'gta6', 'game', 'gaming', 'like', 'get', 'would', 'could', 'really', 'one', 'go', 'see', 'know', 'think', 'good', 'bad', 'way', 'time', 'make', 'come', 'want', 'need'}
     stop_words.update(custom_stops)
@@ -177,268 +486,6 @@ def perform_lda_analysis(texts, n_topics=5, max_features=100):
         st.error(f"LDA analysis failed: {e}")
         return None, None, None
 
-# --- Load CSV from GCS ---
-@st.cache_data(ttl=300)  # Cache the data for 5 minutes
-def load_csv_from_gcs(bucket_name, blob_name):
-    """
-    Load a CSV file from Google Cloud Storage with proper error handling.
-    """
-    try:
-        # Get the GCS client (this will be cached by @st.cache_resource)
-        client = get_gcs_client()
-        if client is None:
-            # The get_gcs_client function has already displayed an error message.
-            return None, "Failed to initialize GCS client."
-
-        # Get the bucket
-        bucket = client.bucket(bucket_name)
-
-        # Get the blob and check if it exists
-        blob = bucket.blob(blob_name)
-        if not blob.exists():
-            error_message = f"File '{blob_name}' not found in bucket '{bucket_name}'."
-            st.error(error_message)
-            return None, error_message
-
-        # Download and read the CSV into a pandas DataFrame
-        st.info(f"Downloading data from gs://{bucket_name}/{blob_name}...")
-        csv_data = blob.download_as_text()
-        df = pd.read_csv(io.StringIO(csv_data))
-
-        if df.empty:
-            st.warning("The CSV file is empty.")
-            return None, "CSV file is empty"
-
-        st.success(f"Successfully loaded {len(df)} rows from {blob_name}")
-        return df, None
-
-    except Exception as e:
-        error_message = f"An unexpected error occurred while loading data from GCS: {e}"
-        st.error(error_message)
-        return None, error_message
-
-# --- RoBERTa Sentiment Analysis ---
-@st.cache_resource
-def load_roberta_model():
-    MODEL_NAME = "cardiffnlp/twitter-roberta-base-sentiment"
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME)
-    return tokenizer, model
-
-# --- Emotion Detection ---
-@st.cache_resource
-def load_emotion_model():
-    """Load emotion detection model"""
-    try:
-        emotion_classifier = pipeline(
-            "text-classification",
-            model="j-hartmann/emotion-english-distilroberta-base",
-            return_all_scores=True
-        )
-        return emotion_classifier
-    except Exception as e:
-        st.error(f"Failed to load emotion model: {e}")
-        return None
-
-def split_comments(comment_text, separator="|||"):
-    """Split comment text by separator and clean individual comments"""
-    if pd.isna(comment_text) or not isinstance(comment_text, str):
-        return []
-    
-    comments = [comment.strip() for comment in comment_text.split(separator)]
-    comments = [comment for comment in comments if comment]
-    return comments
-
-def analyze_emotions_individual(texts, emotion_classifier, batch_size=32):
-    """Analyze emotions for individual comments, handling |||separated comments"""
-    if emotion_classifier is None:
-        return []
-    
-    all_individual_comments = []
-    comment_to_original_mapping = [] 
-    for original_idx, text in enumerate(texts):
-        individual_comments = split_comments(text)
-        for comment in individual_comments:
-            if comment.strip():  
-
-                processed_comment = comment[:512]
-                all_individual_comments.append(processed_comment)
-                comment_to_original_mapping.append(original_idx)
-    
-    if not all_individual_comments:
-        return [{'comments': [], 'emotions': [], 'confidences': []}] * len(texts)
-    
-
-    try:
-        all_emotions = []
-        all_confidences = []
-        
-        for i in range(0, len(all_individual_comments), batch_size):
-            batch = all_individual_comments[i:i+batch_size]
-            batch_results = emotion_classifier(batch)
-            
-            for result in batch_results:
-                best_emotion = max(result, key=lambda x: x['score'])
-                all_emotions.append(best_emotion['label'])
-                all_confidences.append(best_emotion['score'])
-        
-
-        results = []
-        for original_idx in range(len(texts)):
-            original_comments = []
-            original_emotions = []
-            original_confidences = []
-            
-            for comment_idx, mapped_original_idx in enumerate(comment_to_original_mapping):
-                if mapped_original_idx == original_idx:
-                    if comment_idx < len(all_individual_comments):
-                        original_comments.append(all_individual_comments[comment_idx])
-                    if comment_idx < len(all_emotions):
-                        original_emotions.append(all_emotions[comment_idx])
-                        original_confidences.append(all_confidences[comment_idx])
-            
-            results.append({
-                'comments': original_comments,
-                'emotions': original_emotions,
-                'confidences': original_confidences,
-                'total_comments': len(original_comments)
-            })
-        
-        return results
-        
-    except Exception as e:
-        st.error(f"Individual emotion analysis failed: {e}")
-        return [{'comments': [], 'emotions': [], 'confidences': [], 'total_comments': 0}] * len(texts)
-
-def get_emotion_summary(emotion_results):
-    """Get summary statistics for emotions from individual comment analysis"""
-    summaries = []
-    
-    for result in emotion_results:
-        emotions = result.get('emotions', [])
-        confidences = result.get('confidences', [])
-        
-        if not emotions:
-            summaries.append({
-                'dominant_emotion': 'Unknown',
-                'avg_confidence': 0.0,
-                'emotion_distribution': {},
-                'total_comments': 0
-            })
-            continue
-        
-        emotion_counts = {}
-        for emotion in emotions:
-            emotion_counts[emotion] = emotion_counts.get(emotion, 0) + 1
-        
-        dominant_emotion = max(emotion_counts.items(), key=lambda x: x[1])[0]
-        
-        avg_confidence = sum(confidences) / len(confidences) if confidences else 0.0
-
-        total = len(emotions)
-        emotion_distribution = {emotion: (count/total)*100 
-                             for emotion, count in emotion_counts.items()}
-        
-        summaries.append({
-            'dominant_emotion': dominant_emotion,
-            'avg_confidence': avg_confidence,
-            'emotion_distribution': emotion_distribution,
-            'total_comments': total
-        })
-    
-    return summaries
-
-def process_tiktok_emotions(df, comment_column='comments'):
-    """Process TikTok video comments for emotion analysis"""
-    
-    emotion_classifier = load_emotion_model()
-    if emotion_classifier is None:
-        return df
-    
-    comment_texts = df[comment_column].tolist()
-
-    st.info("Analyzing emotions for individual comments...")
-    emotion_results = analyze_emotions_individual(comment_texts, emotion_classifier)
-    
-    emotion_summaries = get_emotion_summary(emotion_results)
-    
-    df['individual_comment_emotions'] = emotion_results
-    df['dominant_emotion'] = [summary['dominant_emotion'] for summary in emotion_summaries]
-    df['avg_emotion_confidence'] = [summary['avg_confidence'] for summary in emotion_summaries]
-    df['total_analyzed_comments'] = [summary['total_comments'] for summary in emotion_summaries]
-    
-    all_emotions = set()
-    for summary in emotion_summaries:
-        all_emotions.update(summary['emotion_distribution'].keys())
-    
-    for emotion in all_emotions:
-        df[f'{emotion}_percentage'] = [
-            summary['emotion_distribution'].get(emotion, 0) 
-            for summary in emotion_summaries
-        ]
-    
-    return df
-
-def display_individual_emotions(emotion_results, video_index=0):
-    """Display individual comment emotions for a specific video"""
-    if video_index < len(emotion_results):
-        result = emotion_results[video_index]
-        st.write(f"Video {video_index + 1} - Individual Comment Analysis:")
-        
-        for i, (comment, emotion, confidence) in enumerate(
-            zip(result['comments'], result['emotions'], result['confidences'])
-        ):
-            st.write(f"Comment {i+1}: {emotion} ({confidence:.2f})")
-            st.write(f"Text: {comment[:100]}...")  # Show first 100 chars
-            st.write("---")
-
-def roberta_sentiment_score(text, tokenizer, model):
-    if pd.isna(text) or not isinstance(text, str) or text.strip() == "":
-        return None, None
-    
-    try:
-        encoded = tokenizer(text, return_tensors='pt', truncation=True, max_length=512)
-        with torch.no_grad():
-            output = model(**encoded)
-        scores = torch.nn.functional.softmax(output.logits, dim=1).squeeze().numpy()
-        
-        label = np.argmax(scores)
-        confidence = scores[label]
-        
-        return label, confidence
-    except Exception:
-        return None, None
-
-def analyze_with_roberta(df, text_column='caption'):
-    tokenizer, model = load_roberta_model()
-    
-    results = df[text_column].apply(lambda x: roberta_sentiment_score(str(x), tokenizer, model))
-    
-    df['roberta_sentiment_label'] = results.apply(
-        lambda x: ['Negative', 'Neutral', 'Positive'][x[0]] if x[0] is not None else 'Unknown'
-    )
-    df['roberta_confidence'] = results.apply(lambda x: x[1] if x[1] is not None else 0.0)
-    
-    return df
-
-def analyze_with_emotions(df, text_column='caption'):
-    emotion_classifier = load_emotion_model()
-    
-    if emotion_classifier is None:
-        df[f'{text_column}_emotion'] = 'Unknown'
-        df[f'{text_column}_emotion_confidence'] = 0.0
-        return df
-    
-    with st.spinner(f"Analyzing emotions in {text_column}..."):
-        texts = df[text_column].fillna('').astype(str).tolist()
-        emotion_results = analyze_emotions_individual(texts, emotion_classifier)
-        emotion_summaries = get_emotion_summary(emotion_results)
-        
-        df[f'{text_column}_emotion'] = [summary['dominant_emotion'] for summary in emotion_summaries]
-        df[f'{text_column}_emotion_confidence'] = [summary['avg_confidence'] for summary in emotion_summaries]
-    
-    return df
-
 def show_explanation_box(title, content):
     """Display a styled explanation box"""
     st.markdown(f"""
@@ -449,31 +496,6 @@ def show_explanation_box(title, content):
     """, unsafe_allow_html=True)
 
 
-@st.cache_data(show_spinner="Running data analysis...") # The spinner will show while this runs the first time
-def run_full_analysis(df, analyze_captions=True, analyze_comments=True):
-    """
-    Runs all the heavy analysis on the DataFrame and returns the processed DataFrame.
-    The result of this function will be cached.
-    """
-    # 1. Roberta Sentiment Analysis (on caption)
-    df = analyze_with_roberta(df.copy(), text_column='caption') # Use .copy() to avoid mutation errors with caching
-
-    # 2. Caption Emotion Analysis (if enabled)
-    if analyze_captions and 'caption' in df.columns:
-        df = analyze_with_emotions(df.copy(), text_column='caption')
-
-    # 3. Comment Emotion Analysis (if enabled)
-    # This part of your original code can be tricky to cache if 'comment_text_col' can change.
-    # For simplicity, we assume 'comments' is the target column for comment analysis.
-    if analyze_comments and 'comments' in df.columns:
-         # Note: Your original code dynamically finds the comment column.
-         # For caching to work reliably, the inputs must be consistent.
-         # If you have a specific column for comment text, use it directly here.
-         # For this example, let's assume the 'comments' column holds the text to be analyzed.
-         # This part may need adjustment based on your exact data structure.
-         df = process_tiktok_emotions(df.copy(), comment_column='comments')
-
-    return df
 # --- Streamlit UI ---
 st.title("TikTok #gta6 Analysis Dashboard")
 st.markdown("*This dashboard displays metrics related to the #gta6 hashtag page on TikTok. All data is scraped in accordance to TikTok privacy conditions.*")
@@ -492,6 +514,7 @@ with st.expander("ℹ️ How to Read This Dashboard", expanded=False):
     - **Average Comments**: Mean number of comments per video in each category
     """)
 
+# Sidebar controls
 st.sidebar.header("Dashboard Controls")
 auto_refresh = st.sidebar.checkbox("Auto-refresh data", value=False)
 
@@ -511,6 +534,7 @@ analysis_text = st.sidebar.selectbox(
 n_topics = st.sidebar.slider("Number of LDA Topics", 3, 10, 5)
 max_features = st.sidebar.slider("Max Features", 50, 500, 100)
 
+# Load data
 with st.spinner("Loading data from Google Cloud Storage..."):
     df, error = load_csv_from_gcs(BUCKET_NAME, CSV_FILENAME)
 
@@ -522,39 +546,23 @@ if df is None or df.empty:
     st.warning("⚠️ No data found")
     st.stop()
 
-with st.spinner("Analyzing sentiment..."):
-    df = analyze_with_roberta(df)
-
-if analyze_captions and 'caption' in df.columns:
-    df = analyze_with_emotions(df, 'caption')
-
-if analyze_comments and 'comments' in df.columns:
-    comment_text_col = None
-    for col in df.columns:
-        if 'comment' in col.lower() and 'text' in col.lower():
-            comment_text_col = col
-            break
-    
-    if comment_text_col:
-        df = analyze_with_emotions(df, comment_text_col)
-    else:
-        st.sidebar.warning("No comment text column found for emotion analysis")
-
-required_columns = ['comments', 'caption']
-missing_columns = [col for col in required_columns if col not in df.columns]
-if missing_columns:
-    st.error(f"❌ Missing required columns: {missing_columns}")
+# Validate data structure
+is_valid, validation_message = validate_dataframe(df)
+if not is_valid:
+    st.error(f"❌ Data validation failed: {validation_message}")
     st.stop()
 
-df['comments'] = pd.to_numeric(df['comments'], errors='coerce').fillna(0)
+# Prepare numeric columns
+df = prepare_numeric_columns(df)
 
+# Run comprehensive analysis (cached)
+df = run_full_analysis(df, analyze_captions=analyze_captions, analyze_comments=analyze_comments)
+
+# Display metrics
 col1, col2, col3, col4 = st.columns(4)
 
 with col1:
-    st.metric(
-        "📹 Total Videos", 
-        f"{len(df):,}"
-    )
+    st.metric("📹 Total Videos", f"{len(df):,}")
 
 with col2:
     avg_confidence = df['roberta_confidence'].mean()
@@ -565,8 +573,8 @@ with col2:
     )
 
 with col3:
-    if 'caption_emotion_confidence' in df.columns:
-        avg_emotion_conf = df['caption_emotion_confidence'].mean()
+    if f'{CAPTION_COLUMN}_emotion_confidence' in df.columns:
+        avg_emotion_conf = df[f'{CAPTION_COLUMN}_emotion_confidence'].mean()
         st.metric(
             "Avg Emotion Confidence",
             f"{avg_emotion_conf:.1%}",
@@ -576,13 +584,17 @@ with col3:
         st.metric("Emotion Analysis", "Disabled")
 
 with col4:
-    avg_comments = df['comments'].mean()
-    st.metric(
-        "Avg Comments", 
-        f"{avg_comments:,.0f}",
-        help="Average number of comments per video. Higher = more engaging content."
-    )
+    if COMMENT_COUNT_COLUMN in df.columns:
+        avg_comments = df[COMMENT_COUNT_COLUMN].mean()
+        st.metric(
+            "Avg Comments", 
+            f"{avg_comments:,.0f}",
+            help="Average number of comments per video. Higher = more engaging content."
+        )
+    else:
+        st.metric("Comments Data", "Not Available")
 
+# Sidebar filters
 st.sidebar.subheader("🔍 Filters")
 sentiment_filter = st.sidebar.multiselect(
     "Filter by Sentiment",
@@ -590,18 +602,20 @@ sentiment_filter = st.sidebar.multiselect(
     default=df['roberta_sentiment_label'].unique()
 )
 
-if 'caption_emotion' in df.columns:
+emotion_column = f'{CAPTION_COLUMN}_emotion'
+if emotion_column in df.columns:
     emotion_filter = st.sidebar.multiselect(
         "Filter by Emotion",
-        options=df['caption_emotion'].unique(),
-        default=df['caption_emotion'].unique()
+        options=df[emotion_column].unique(),
+        default=df[emotion_column].unique()
     )
 else:
     emotion_filter = []
 
+# Apply filters
 filtered_df = df[df['roberta_sentiment_label'].isin(sentiment_filter)]
-if emotion_filter and 'caption_emotion' in df.columns:
-    filtered_df = filtered_df[filtered_df['caption_emotion'].isin(emotion_filter)]
+if emotion_filter and emotion_column in df.columns:
+    filtered_df = filtered_df[filtered_df[emotion_column].isin(emotion_filter)]
 
 
 tab1, tab2, tab3, tab4 = st.tabs(["Sentiment Analysis", "Emotion Analysis", "Topic Modeling", "Detailed Data"])
@@ -1077,7 +1091,7 @@ if display_cols:
     csv_data = display_df.to_csv(index=show_index)
         
     st.download_button(
-        label="📥 Download Displayed Data as CSV",
+        label="Download Displayed Data as CSV",
         data=csv_data,
         file_name=f"tiktok_analysis_display_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.csv",
         mime="text/csv"
